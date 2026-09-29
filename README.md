@@ -24,7 +24,7 @@
 ## 一键安装
 
 ```bash
-git clone https://github.com/<你的用户名>/lidar_nav2_installer.git
+git clone https://github.com/Camille-123-z/lidar_nav2_installer.git
 cd lidar_nav2_installer
 chmod +x install.sh
 
