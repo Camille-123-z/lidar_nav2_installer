@@ -10,12 +10,14 @@
 #    ~/<name>_lidar_ws   Livox MID-360 驱动 + SLAM 建图 + 点云转换
 #      ├─ Livox-SDK2 (系统级安装)  ├─ livox_ros_driver2 (ROS2 封装)
 #      ├─ SLAM: FAST-LIO2 / Point-LIO (可选)
+#      ├─ 建图后端: LIO-LoopClosure — Scan Context 回环 + GTSAM 位姿图优化 (可选)
 #      ├─ pointcloud_to_laserscan  └─ pointcloud_to_grid
+#    ~/<name>_loc_ws     全局定位: FAST_LIO_LOCALIZATION_ROS2 — ICP 地图匹配 (可选)
 #    Nav2 + slam_toolbox 通过 apt 二进制安装（不属于任何工作空间）
 #
 #  用法：
 #    ./install.sh                       # 交互式选择
-#    ./install.sh -n myrobot -r humble -c g2 -s fastlio2
+#    ./install.sh -n myrobot -r humble -c g2 -s fastlio2 -p loopclosure -l fastlio_loc
 #    ./install.sh -h                    # 查看全部参数
 # =============================================================================
 set -euo pipefail
@@ -67,6 +69,21 @@ PCL_TO_LASERSCAN_URL="https://github.com/ros-perception/pointcloud_to_laserscan.
 PCL_TO_GRID_URL="https://github.com/jkk-research/pointcloud_to_grid.git"
 PCL_TO_GRID_BRANCH="ros2"
 
+# 建图后端（Scan Context 回环 + GTSAM iSAM2 位姿图优化，纯后端，与前端 LIO 松耦合）
+PGO_LOOPCLOSURE_URL="https://github.com/Linlinqiu/LIO-LoopClosure.git"
+PGO_LOOPCLOSURE_DIR="LIO-LoopClosure"
+PGO_LOOPCLOSURE_LABEL="LIO-LoopClosure (Scan Context + GTSAM 回环)"
+
+# 全局定位（FAST-LIO + 地图匹配；ROS2 移植，Open3D ICP 扫描-地图配准）
+# 注：engcang 的 FAST-LIO-Localization-SC-QN(Quatro+Nano-GICP) 为 ROS1，此为 ROS2 等价替代
+LOCALIZATION_URL="https://github.com/myeongw002/FAST_LIO_LOCALIZATION_ROS2.git"
+LOCALIZATION_DIR="FAST_LIO_LOCALIZATION_ROS2"
+LOCALIZATION_LABEL="FAST_LIO_LOCALIZATION_ROS2 (ICP 全局定位)"
+
+# GTSAM（LIO-LoopClosure 依赖，apt/PPA 失败时源码编译）
+GTSAM_SRC_URL="https://github.com/borglab/gtsam.git"
+GTSAM_SRC_TAG="4.2.0"
+
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 USE_MIRROR="${USE_MIRROR:-0}"
 GH_PROXY="${GH_PROXY:-https://ghproxy.com/https://github.com}"
@@ -81,6 +98,40 @@ gh_clone() {
   fi
 }
 
+# 安装 GTSAM（LIO-LoopClosure 位姿图优化依赖）。
+# 顺序：已安装 → borglab PPA(libgtsam-dev) → 源码编译。
+install_gtsam() {
+  info "===== 安装 GTSAM（建图后端依赖） ====="
+  if [ -d /usr/include/gtsam ] || [ -f /usr/local/include/gtsam/inference/Symbol.h ]; then
+    ok "GTSAM 头文件已存在，跳过"
+    return 0
+  fi
+  # 1) borglab PPA
+  if command -v add-apt-repository >/dev/null 2>&1 \
+     && sudo apt-get install -y software-properties-common >/dev/null 2>&1 \
+     && sudo add-apt-repository -y ppa:borglab/gtsam-release-4.1 >/dev/null 2>&1; then
+    sudo apt-get update
+    if sudo apt-get install -y libgtsam-dev libgtsam-unstable-dev >/dev/null 2>&1; then
+      ok "通过 borglab PPA 安装 GTSAM"
+      return 0
+    fi
+  fi
+  # 2) 源码编译 fallback
+  warn "PPA 安装 GTSAM 失败，改为源码编译 ${GTSAM_SRC_TAG}（耗时较长）..."
+  mkdir -p "${LIDAR_WS}/third_party"
+  cd "${LIDAR_WS}/third_party"
+  if [ ! -d gtsam ]; then
+    gh_clone "${GTSAM_SRC_URL}" -b "${GTSAM_SRC_TAG}" gtsam
+  fi
+  cd gtsam
+  mkdir -p build && cd build
+  cmake .. -DGTSAM_USE_SYSTEM_EIGEN=ON -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+  make -j"$(nproc)"
+  sudo make install
+  sudo ldconfig
+  ok "GTSAM 源码编译安装完成"
+}
+
 usage() {
   cat <<EOF
 用法: $0 [选项]
@@ -92,12 +143,16 @@ usage() {
                   g2  = Gemini 2 / Astra / DaBai 等 (v1.x, main 分支)
                   g3  = Gemini 3 系列 330/430     (v2.x, v2-main 分支)
   -s <slam>     SLAM 算法，逗号分隔: fastlio2 | pointlio（也可 all/none）
+  -p <pgo>      建图后端(回环+位姿图优化): loopclosure | none（默认 none）
+                  loopclosure = LIO-LoopClosure（Scan Context + GTSAM，需装 GTSAM）
+  -l <loc>      全局定位: fastlio_loc | none（默认 none）
+                  fastlio_loc = FAST_LIO_LOCALIZATION_ROS2（ICP 地图匹配）
   -m            启用国内镜像代理（git clone）
   -y            非交互模式，缺失项使用默认值
   -h            显示本帮助
 
 示例:
-  $0 -n myrobot -r humble -c g3 -s fastlio2,pointlio
+  $0 -n myrobot -r humble -c g3 -s fastlio2,pointlio -p loopclosure -l fastlio_loc
   $0 -y                                  # 全部默认，非交互
 EOF
 }
@@ -123,16 +178,40 @@ resolve_slam() {
   esac
 }
 
+# 把建图后端编号/名称解析为 key 列表（输出到 PGO_SELECTED）
+PGO_SELECTED=""
+resolve_pgo() {
+  local input; input=$(echo "$1" | tr -d ' ')
+  PGO_SELECTED=""
+  case "$input" in
+    ""|0|none|NONE) PGO_SELECTED="" ;;
+    *) if echo ",${input}," | grep -qE ',(loopclosure|1|all|ALL),'; then PGO_SELECTED="loopclosure"; fi ;;
+  esac
+}
+
+# 把定位编号/名称解析为 key 列表（输出到 LOC_SELECTED）
+LOC_SELECTED=""
+resolve_loc() {
+  local input; input=$(echo "$1" | tr -d ' ')
+  LOC_SELECTED=""
+  case "$input" in
+    ""|0|none|NONE) LOC_SELECTED="" ;;
+    *) if echo ",${input}," | grep -qE ',(fastlio_loc|1|all|ALL),'; then LOC_SELECTED="fastlio_loc"; fi ;;
+  esac
+}
+
 # -----------------------------------------------------------------------------
 # 解析命令行参数
 # -----------------------------------------------------------------------------
-WS_NAME=""; ROS_DISTRO=""; CAMERA_SEL=""; SLAM_SEL=""; NONINTERACTIVE=0
-while getopts "n:r:c:s:myh" opt; do
+WS_NAME=""; ROS_DISTRO=""; CAMERA_SEL=""; SLAM_SEL=""; PGO_SEL=""; LOC_SEL=""; NONINTERACTIVE=0
+while getopts "n:r:c:s:p:l:myh" opt; do
   case "$opt" in
     n) WS_NAME="$OPTARG" ;;
     r) ROS_DISTRO="$OPTARG" ;;
     c) CAMERA_SEL="$OPTARG" ;;
     s) SLAM_SEL="$OPTARG" ;;
+    p) PGO_SEL="$OPTARG" ;;
+    l) LOC_SEL="$OPTARG" ;;
     m) USE_MIRROR=1 ;;
     y) NONINTERACTIVE=1 ;;
     h) usage; exit 0 ;;
@@ -210,25 +289,61 @@ else
     resolve_slam "${REPLY:-1,2}"
     SLAM_SEL="$SLAM_SELECTED"
   fi
+
+  if [ -z "$PGO_SEL" ]; then
+    echo
+    echo "是否安装建图后端 (Scan Context 回环 + GTSAM 位姿图优化) ?"
+    echo "  1) LIO-LoopClosure (推荐，需安装 GTSAM)"
+    echo "  0) 不安装"
+    printf '请输入编号 (默认 1): '
+    read -r REPLY
+    case "${REPLY:-1}" in
+      1) PGO_SEL=loopclosure ;;
+      0) PGO_SEL=none ;;
+      *) PGO_SEL=loopclosure ;;
+    esac
+  fi
+
+  if [ -z "$LOC_SEL" ]; then
+    echo
+    echo "是否安装全局定位 (FAST-LIO + ICP 地图匹配) ?"
+    echo "  1) FAST_LIO_LOCALIZATION_ROS2 (推荐)"
+    echo "  0) 不安装"
+    printf '请输入编号 (默认 1): '
+    read -r REPLY
+    case "${REPLY:-1}" in
+      1) LOC_SEL=fastlio_loc ;;
+      0) LOC_SEL=none ;;
+      *) LOC_SEL=fastlio_loc ;;
+    esac
+  fi
 fi
 
 # 解析最终选择
 resolve_slam "$SLAM_SEL"
 SLAM_SELECTED="$(echo "$SLAM_SELECTED" | xargs)"   # 去掉首尾空格
+resolve_pgo "$PGO_SEL"
+PGO_SELECTED="$(echo "$PGO_SELECTED" | xargs)"
+resolve_loc "$LOC_SEL"
+LOC_SELECTED="$(echo "$LOC_SELECTED" | xargs)"
 
 # 校验相机选择
 case "$CAMERA_SEL" in g2|g3|none) ;; *) CAMERA_SEL=g2; warn "未知相机参数，回退为 g2" ;; esac
 
 ORBBEC_WS="${HOME}/${WS_NAME}_orbbec_ws"
 LIDAR_WS="${HOME}/${WS_NAME}_lidar_ws"
+LOC_WS="${HOME}/${WS_NAME}_loc_ws"
 
 echo
 info "========== 安装配置 =========="
 log "  ROS 版本   : ${ROS_DISTRO} (Ubuntu ${UBUNTU_VER})"
 log "  工作空间   : ${ORBBEC_WS}"
 log "             : ${LIDAR_WS}"
+log "             : ${LOC_WS}"
 log "  相机驱动   : $([ "$CAMERA_SEL" = none ] && echo '不安装' || echo "${CAMERA_SEL} (${ORBBEC_BRANCH[$CAMERA_SEL]})")"
 log "  SLAM 算法  : $([ -n "$SLAM_SELECTED" ] && echo "$SLAM_SELECTED" || echo '不安装')"
+log "  建图后端   : $([ -n "$PGO_SELECTED" ] && echo "$PGO_SELECTED" || echo '不安装')"
+log "  全局定位   : $([ -n "$LOC_SELECTED" ] && echo "$LOC_SELECTED" || echo '不安装')"
 log "  国内镜像   : $([ "$USE_MIRROR" = 1 ] && echo '开启' || echo '关闭')"
 log "=============================="
 
@@ -241,7 +356,7 @@ sudo apt-get install -y \
   git cmake build-essential \
   python3-pip python3-colcon-common-extensions python3-vcstool python3-rosdep \
   libeigen3-dev libpcl-dev libyaml-cpp-dev libboost-all-dev \
-  libgflags-dev libgoogle-glog-dev nlohmann-json3-dev \
+  libgflags-dev libgoogle-glog-dev nlohmann-json3-dev libtbb-dev \
   ros-${ROS_DISTRO}-navigation2 \
   ros-${ROS_DISTRO}-nav2-bringup \
   ros-${ROS_DISTRO}-slam-toolbox \
@@ -250,7 +365,10 @@ sudo apt-get install -y \
   ros-${ROS_DISTRO}-tf-transformations \
   ros-${ROS_DISTRO}-image-transport \
   ros-${ROS_DISTRO}-camera-info-manager \
-  ros-${ROS_DISTRO}-diagnostic-updater
+  ros-${ROS_DISTRO}-diagnostic-updater \
+  ros-${ROS_DISTRO}-std-srvs \
+  ros-${ROS_DISTRO}-grid-map-msgs \
+  ros-${ROS_DISTRO}-tf2-geometry-msgs
 sudo apt-get install -y ros-${ROS_DISTRO}-grid-map-msgs 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
@@ -342,14 +460,26 @@ if [ ! -d pointcloud_to_grid ]; then
   gh_clone "${PCL_TO_GRID_URL}" -b "${PCL_TO_GRID_BRANCH}"
 fi
 
-# 7.4 livox_ros_driver2 启用 ROS2 package.xml
+# 7.4 建图后端（可选）：Scan Context 回环 + GTSAM 位姿图优化
+if [ -n "$PGO_SELECTED" ]; then
+  cd "${LIDAR_WS}/src"
+  if [ ! -d "${PGO_LOOPCLOSURE_DIR}" ]; then
+    info "拉取 ${PGO_LOOPCLOSURE_LABEL} ..."
+    gh_clone "${PGO_LOOPCLOSURE_URL}" "${PGO_LOOPCLOSURE_DIR}"
+  else
+    info "已存在 ${PGO_LOOPCLOSURE_DIR}，跳过 clone"
+  fi
+  install_gtsam
+fi
+
+# 7.5 livox_ros_driver2 启用 ROS2 package.xml
 info "配置 livox_ros_driver2（启用 ROS2 package.xml）..."
 cd "${LIDAR_WS}/src/livox_ros_driver2"
 if [ ! -f package.xml ]; then
   [ -f package_ROS2.xml ] && cp package_ROS2.xml package.xml || die "未找到 package_ROS2.xml"
 fi
 
-# 7.5 依赖 + 编译
+# 7.6 依赖 + 编译
 info "安装雷达工作空间依赖..."
 ( cd "${LIDAR_WS}" && rosdep install --from-paths src --ignore-src -r -y ) || warn "雷达依赖 rosdep 安装有遗漏"
 
@@ -358,7 +488,33 @@ info "编译雷达工作空间..."
 ok "雷达工作空间完成"
 
 # -----------------------------------------------------------------------------
-# 8. 完成
+# 8. 全局定位工作空间（可选）：FAST-LIO + ICP 地图匹配
+# -----------------------------------------------------------------------------
+if [ -n "$LOC_SELECTED" ]; then
+  info "===== 搭建全局定位工作空间 ${LOC_WS} ====="
+  mkdir -p "${LOC_WS}/src"
+  cd "${LOC_WS}/src"
+  if [ ! -d "${LOCALIZATION_DIR}" ]; then
+    gh_clone "${LOCALIZATION_URL}" "${LOCALIZATION_DIR}"
+  fi
+
+  info "安装定位 Python 依赖（open3d / tf_transformations / sensor_msgs_py）..."
+  if ! python3 -m pip install --user open3d tf_transformations sensor_msgs_py 2>/dev/null; then
+    warn "pip --user 失败，尝试 --break-system-packages ..."
+    python3 -m pip install --break-system-packages open3d tf_transformations sensor_msgs_py 2>/dev/null \
+      || warn "open3d 安装失败，请手动安装"
+  fi
+
+  info "安装定位工作空间依赖..."
+  ( cd "${LOC_WS}" && rosdep install --from-paths src --ignore-src -r -y ) || warn "定位依赖 rosdep 安装有遗漏"
+
+  info "编译定位工作空间..."
+  ( cd "${LOC_WS}" && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" )
+  ok "全局定位工作空间完成"
+fi
+
+# -----------------------------------------------------------------------------
+# 9. 完成
 # -----------------------------------------------------------------------------
 echo
 ok "全部安装完成！"
@@ -367,7 +523,8 @@ echo "================================================================"
 echo "  加载环境（按需 source 对应工作空间）："
 echo "    source /opt/ros/${ROS_DISTRO}/setup.bash"
 [ "$CAMERA_SEL" != none ] && echo "    source ${ORBBEC_WS}/install/setup.bash   # 相机"
-echo "    source ${LIDAR_WS}/install/setup.bash    # 雷达/SLAM"
+echo "    source ${LIDAR_WS}/install/setup.bash    # 雷达/SLAM/建图后端"
+[ -n "$LOC_SELECTED" ] && echo "    source ${LOC_WS}/install/setup.bash      # 全局定位"
 echo
 echo "  启动示例："
 [ "$CAMERA_SEL" != none ] && echo "    ros2 launch orbbec_camera gemini.launch.py        # 相机(按型号选 launch)"
@@ -378,8 +535,14 @@ for key in $SLAM_SELECTED; do
     pointlio) echo "    ros2 launch point_lio mapping.launch.py             # Point-LIO 建图" ;;
   esac
 done
+[ -n "$PGO_SELECTED" ] && echo "    ros2 launch lio_loopclosure pointlio_mid360.launch.py  # Scan Context 回环 + GTSAM 后端"
+[ -n "$PGO_SELECTED" ] && echo "    ros2 service call /save_map std_srvs/srv/Empty        # 保存 corrected_map.pcd"
+[ -n "$LOC_SELECTED" ] && echo "    ros2 launch fast_lio_localization velodyne_localization.launch.py  # 全局定位(先改 map_file_path)"
 echo "    ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node  # 3D->2D 扫描"
+echo "    ros2 run pointcloud_to_grid pointcloud_to_grid_node  # 3D 地图->2D 栅格"
 echo "    ros2 launch nav2_bringup bringup_launch.py          # Nav2 导航"
 echo "================================================================"
 echo
 ok "FAST-LIO2 与 Point-LIO 包名不同（fast_lio / point_lio），可同时安装"
+[ -n "$PGO_SELECTED" ] && ok "建图后端 LIO-LoopClosure 与前端 LIO 松耦合，可独立开关"
+[ -n "$LOC_SELECTED" ] && warn "定位需先建图得到 .pcd，并在 config 中填 map_file_path 绝对路径"
